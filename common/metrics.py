@@ -1,12 +1,13 @@
 # common/metrics.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 import pandas as pd
+import numpy as np
 
 
 # -----------------------------
-# Column normalization
+# Column normalization (light)
 # -----------------------------
 def normalize_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str], list]:
     """
@@ -43,21 +44,19 @@ def normalize_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str], l
     colmap["service_status"] = pick("service_status", "servicestatus", "serviceability", "serviceable") or ""
 
     colmap["platform"] = pick("ecommerce", "platform", "channel", "marketplace", "source") or ""
-
     colmap["stock"] = pick("stock", "availability", "in_stock", "stock_status") or ""
 
-    colmap["price"] = pick("price", "selling_price", "sale_price") or ""
-    colmap["mrp"] = pick("mrp", "list_price", "msrp") or ""
+    # price / promo
+    colmap["price"] = pick("price", "selling_price", "sale_price", "sp", "current_price") or ""
+    colmap["mrp"] = pick("mrp", "list_price", "msrp", "regular_price") or ""
     colmap["disc_pct"] = pick("discount_percentage", "discount_pct", "disc_pct", "discount_percent") or ""
     colmap["disc_amt"] = pick("discount_amount", "discount_amt", "disc_amt") or ""
-
     colmap["coupon"] = pick("coupon", "coupon_text") or ""
     colmap["offer"] = pick("offer", "offer_text", "offers", "promotion", "promo") or ""
     colmap["super_offer"] = pick("super_offer", "superoffer") or ""
     colmap["super_saver"] = pick("super_saver", "supersaver") or ""
 
     colmap["avg_rating"] = pick("avg_rating", "average_rating", "rating") or ""
-
     colmap["crawled_date"] = pick("crawled_date", "crawl_date", "date", "timestamp", "crawledatetime") or ""
 
     colmap = {k: v for k, v in colmap.items() if v}
@@ -68,6 +67,8 @@ def normalize_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str], l
         warnings.append("Pincode column not detected (expected Pincode/pin_code). Stockout metrics may be skipped.")
     if "stock" not in colmap:
         warnings.append("Stock column not detected (expected Stock/availability). Stockout metrics may be skipped.")
+    if "platform" not in colmap:
+        warnings.append("Platform column not detected (expected ecommerce/platform). Some metrics may be skipped.")
 
     return df, colmap, warnings
 
@@ -110,8 +111,27 @@ def _infer_period(df: pd.DataFrame, colmap: Dict[str, str]) -> Optional[str]:
 
 
 def _is_oos(stock_series: pd.Series) -> pd.Series:
+    """
+    Returns True if stock status represents Out Of Stock.
+    Handles real-world variations safely.
+    """
     s = stock_series.astype(str).str.strip().str.lower()
-    return s.str.contains("out", na=False) | s.isin({"oos", "out_of_stock", "outofstock", "0", "false"})
+
+    # normalize spacing
+    s = s.str.replace(r"\s+", " ", regex=True)
+
+    OOS_VALUES = {
+        "out of stock",
+        "out-of-stock",
+        "out_of_stock",
+        "oos",
+        "sold out",
+        "not available",
+        "0",
+        "false"
+    }
+
+    return s.isin(OOS_VALUES)
 
 
 def _build_pin_to_city(map_df: pd.DataFrame) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
@@ -147,6 +167,34 @@ def _build_pin_to_city(map_df: pd.DataFrame) -> Tuple[Dict[str, str], Optional[s
     return pin_to_city, pin_col, city_col
 
 
+def _coerce_num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _promo_flag(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.Series:
+    # A robust boolean: promo if any discount/coupon/offer/super flags present.
+    promo = pd.Series([False] * len(df), index=df.index)
+
+    if "disc_pct" in colmap:
+        promo = promo | (_coerce_num(_get_series(df, colmap["disc_pct"])).fillna(0) > 0)
+    if "disc_amt" in colmap:
+        promo = promo | (_coerce_num(_get_series(df, colmap["disc_amt"])).fillna(0) > 0)
+
+    if "coupon" in colmap:
+        c = _get_series(df, colmap["coupon"]).astype(str).fillna("").str.strip()
+        promo = promo | (c != "") & (~c.str.lower().isin({"nan", "none"}))
+
+    if "offer" in colmap:
+        o = _get_series(df, colmap["offer"]).astype(str).fillna("").str.strip()
+        promo = promo | (o != "") & (~o.str.lower().isin({"nan", "none"}))
+
+    for key in ["super_offer", "super_saver"]:
+        if key in colmap:
+            v = _get_series(df, colmap[key]).astype(str).fillna("").str.strip().str.lower()
+            promo = promo | v.isin({"true", "1", "yes", "y"})
+    return promo
+
+
 # -----------------------------
 # STOCKOUT METRICS
 # -----------------------------
@@ -172,7 +220,7 @@ def compute_stockout_metrics(
     out["pincode_oos_sku_table"] = pd.DataFrame(columns=["pincode", "city", "oos_skus", "total_skus", "oos_pct"])
     out["city_oos_sku_table"] = pd.DataFrame(columns=["city", "oos_skus", "total_skus", "oos_pct"])
 
-    # ✅ NEW: platform drilldown tables
+    # platform drilldown tables
     out["pincode_platform_oos_sku_table"] = pd.DataFrame(
         columns=["pincode", "city", "platform", "oos_skus", "total_skus", "oos_pct"]
     )
@@ -360,12 +408,11 @@ def compute_stockout_metrics(
         out["city_oos_sku_table"] = city_tbl[["city", "oos_skus", "total_skus", "oos_pct"]]
 
     # -------------------------
-    # ✅ NEW: Platform drilldown (Pincode × Platform, City × Platform)
+    # Platform drilldown (Pincode × Platform, City × Platform)
     # -------------------------
     if "platform" in base.columns:
         bp = base.dropna(subset=["platform"]).copy()
         if len(bp):
-
             # pincode x platform
             pp_total = bp.groupby(["pincode", "platform"])["sku"].nunique().rename("total_skus")
             pp_oos = bp.loc[bp["is_oos"]].groupby(["pincode", "platform"])["sku"].nunique().rename("oos_skus")
@@ -378,7 +425,7 @@ def compute_stockout_metrics(
                 axis=1,
             )
 
-            # attach city for pincode drilldown
+            # attach city
             if pin_to_city:
                 pp_tbl["city"] = pp_tbl["pincode"].astype(str).map(pin_to_city).fillna("")
             elif "city" in bp.columns:
@@ -541,5 +588,310 @@ def compare_periods(
     out["comparisons"]["critical_skus"] = crit.loc[crit["is_critical"]].sort_values(
         ["oos_pct", "delta_oos_pct"], ascending=False
     ).head(max(top_n, 10))
+
+    return out
+
+
+# -----------------------------
+# COMPETITOR PRICE / PROMO CHANGES (ADD-ON)
+# -----------------------------
+def compute_competitor_price_promo_changes(
+    current_df: pd.DataFrame,
+    previous_df: Optional[pd.DataFrame],
+    require_serviced: bool,
+    price_change_threshold_pct: float,
+    promotion_change_threshold_pct: float,
+) -> Dict[str, Any]:
+    """
+    Returns:
+      - changed_rows: DataFrame of competitor SKU x platform with change flags
+      - summary: counts & averages (used when list is large)
+    """
+    cur, ccol, cwarn = normalize_columns(current_df)
+    cur = _filter_serviced(cur, ccol, require_serviced)
+
+    out: Dict[str, Any] = {"warnings": cwarn}
+
+    if cur is None or len(cur) == 0:
+        out["changed_rows"] = pd.DataFrame()
+        out["summary"] = {}
+        out["warnings"].append("Competitor price/promo: no rows available in current after filters.")
+        return out
+
+    if not {"sku", "platform"}.issubset(set(ccol.keys())):
+        out["changed_rows"] = pd.DataFrame()
+        out["summary"] = {}
+        out["warnings"].append("Competitor price/promo: missing sku/platform columns.")
+        return out
+
+    # current aggregates
+    cur_tbl = pd.DataFrame({
+        "sku": _get_series(cur, ccol["sku"]).astype(str).str.strip(),
+        "platform": _get_series(cur, ccol["platform"]).astype(str).str.strip(),
+    })
+
+    if "price" in ccol:
+        cur_tbl["price"] = _coerce_num(_get_series(cur, ccol["price"]))
+    else:
+        cur_tbl["price"] = np.nan
+
+    if "disc_pct" in ccol:
+        cur_tbl["disc_pct"] = _coerce_num(_get_series(cur, ccol["disc_pct"]))
+    else:
+        cur_tbl["disc_pct"] = 0.0
+
+    cur_tbl["promo_flag"] = _promo_flag(cur, ccol)
+
+    cur_agg = (
+        cur_tbl.groupby(["platform", "sku"], as_index=False)
+        .agg(
+            price=("price", "median"),
+            disc_pct=("disc_pct", "max"),
+            promo_flag=("promo_flag", "max"),
+        )
+    )
+
+    if previous_df is None or len(previous_df) == 0:
+        # If no previous, treat "new promo" as promo_flag True and price_change NA
+        cur_agg["prev_price"] = np.nan
+        cur_agg["prev_disc_pct"] = 0.0
+        cur_agg["prev_promo_flag"] = False
+    else:
+        prev, pcol, pwarn = normalize_columns(previous_df)
+        prev = _filter_serviced(prev, pcol, require_serviced)
+
+        out["warnings"] += pwarn
+
+        if prev is None or len(prev) == 0 or not {"sku", "platform"}.issubset(set(pcol.keys())):
+            cur_agg["prev_price"] = np.nan
+            cur_agg["prev_disc_pct"] = 0.0
+            cur_agg["prev_promo_flag"] = False
+        else:
+            prev_tbl = pd.DataFrame({
+                "sku": _get_series(prev, pcol["sku"]).astype(str).str.strip(),
+                "platform": _get_series(prev, pcol["platform"]).astype(str).str.strip(),
+            })
+
+            if "price" in pcol:
+                prev_tbl["price"] = _coerce_num(_get_series(prev, pcol["price"]))
+            else:
+                prev_tbl["price"] = np.nan
+
+            if "disc_pct" in pcol:
+                prev_tbl["disc_pct"] = _coerce_num(_get_series(prev, pcol["disc_pct"]))
+            else:
+                prev_tbl["disc_pct"] = 0.0
+
+            prev_tbl["promo_flag"] = _promo_flag(prev, pcol)
+
+            prev_agg = (
+                prev_tbl.groupby(["platform", "sku"], as_index=False)
+                .agg(
+                    prev_price=("price", "median"),
+                    prev_disc_pct=("disc_pct", "max"),
+                    prev_promo_flag=("promo_flag", "max"),
+                )
+            )
+
+            cur_agg = cur_agg.merge(prev_agg, on=["platform", "sku"], how="left")
+            cur_agg["prev_price"] = cur_agg["prev_price"].astype(float)
+            cur_agg["prev_disc_pct"] = cur_agg["prev_disc_pct"].fillna(0.0).astype(float)
+            cur_agg["prev_promo_flag"] = cur_agg["prev_promo_flag"].fillna(False).astype(bool)
+
+    # deltas
+    cur_agg["price_change_pct"] = np.where(
+        (cur_agg["prev_price"].notna()) & (cur_agg["prev_price"] > 0) & (cur_agg["price"].notna()),
+        (cur_agg["price"] - cur_agg["prev_price"]) / cur_agg["prev_price"] * 100.0,
+        np.nan,
+    )
+    cur_agg["disc_change_pp"] = cur_agg["disc_pct"].fillna(0.0) - cur_agg["prev_disc_pct"].fillna(0.0)
+
+    # flags
+    cur_agg["is_price_change"] = cur_agg["price_change_pct"].abs() >= float(price_change_threshold_pct)
+    cur_agg["is_new_promo"] = (cur_agg["promo_flag"] == True) & (cur_agg["prev_promo_flag"] == False)
+    cur_agg["is_promo_increase"] = cur_agg["disc_change_pp"] >= float(promotion_change_threshold_pct)
+
+    changed = cur_agg[cur_agg["is_price_change"] | cur_agg["is_new_promo"] | cur_agg["is_promo_increase"]].copy()
+
+    # summary stats (for big lists)
+    summary: Dict[str, Any] = {}
+    if len(changed):
+        price_increases = changed[changed["price_change_pct"].notna() & (changed["price_change_pct"] > 0)]
+        promo_skus = changed[changed["promo_flag"] == True]
+
+        summary = {
+            "impacted_sku_platform_rows": int(len(changed)),
+            "unique_skus": int(changed["sku"].nunique()),
+            "unique_platforms": int(changed["platform"].nunique()),
+            "avg_price_increase_pct": float(price_increases["price_change_pct"].mean()) if len(price_increases) else None,
+            "avg_discount_pct": float(promo_skus["disc_pct"].mean()) if len(promo_skus) else None,
+        }
+
+    # order for readability
+    changed = changed.sort_values(
+        ["platform", "is_price_change", "price_change_pct", "disc_change_pp", "sku"],
+        ascending=[True, False, False, False, True],
+    )
+
+    out["changed_rows"] = changed
+    out["summary"] = summary
+    return out
+
+# -----------------------------
+# HISTORY BUNDLE (LAST N INSTANCES)
+# -----------------------------
+def _period_from_df(df: pd.DataFrame, colmap: Dict[str, str]) -> str:
+    p = _infer_period(df, colmap)
+    if p:
+        return str(p)
+    # fallback: stable label if date not present
+    return "unknown_period"
+
+
+def build_history_bundle(
+    history_dfs: Optional[List[pd.DataFrame]] = None,
+    *,
+    previous_dfs: Optional[List[pd.DataFrame]] = None,          # alias
+    current_df: Optional[pd.DataFrame] = None,                  # ✅ included
+    pincode_map_df: Optional[pd.DataFrame] = None,              # ✅ included (accepted even if unused)
+    require_serviced: bool = True,
+    n_last: int = 5,
+    **kwargs: Any,                                              # ✅ future-proof: ignore unexpected kwargs
+) -> Dict[str, Any]:
+    """
+    Builds compact history features used by the agent/render layer:
+      - sku_oos_last_n: top SKUs that are OOS in the last n instances (count + pct)
+      - oos_timeline: overall OOS% by period (for chart)
+      - sku_sparklines: per SKU OOS% series (for sparkline rendering)
+
+    Accepts flexible inputs:
+      - history_dfs: explicit ordered list of dfs
+      - previous_dfs + current_df: preferred wiring from agent/backend
+      - pincode_map_df: accepted for API compatibility (unused here)
+    """
+
+    # ---------- Resolve the input frames list ----------
+    if history_dfs is None:
+        history_dfs = []
+
+        if previous_dfs:
+            history_dfs.extend(list(previous_dfs))
+
+        if current_df is not None:
+            history_dfs.append(current_df)
+
+    out: Dict[str, Any] = {
+        "warnings": [],
+        "n_last": int(n_last),
+        "available_instances": int(len(history_dfs or [])),
+        "sku_oos_last_n": pd.DataFrame(columns=["sku", "oos_instances", "n_instances", "oos_instance_pct"]),
+        "oos_timeline": pd.DataFrame(columns=["period", "overall_oos_pct"]),
+        "sku_sparklines": {},  # sku -> list[float] aligned to oos_timeline periods
+        "periods": [],
+    }
+
+    if not history_dfs:
+        out["warnings"].append("No historical files provided; history bundle skipped.")
+        return out
+
+    # consider only last n_last inputs (caller should pass ordered, but we are defensive)
+    frames = history_dfs[-int(n_last):] if len(history_dfs) > int(n_last) else history_dfs
+
+    per_instance_rows: List[pd.DataFrame] = []
+    overall_series: List[Dict[str, Any]] = []
+    sku_period_rows: List[pd.DataFrame] = []
+
+    for raw in frames:
+        df, colmap, warn = normalize_columns(raw)
+        df = _filter_serviced(df, colmap, require_serviced)
+        out["warnings"] += list(warn or [])
+
+        if df is None or len(df) == 0:
+            continue
+        if not {"sku", "pincode", "stock"}.issubset(set(colmap.keys())):
+            out["warnings"].append("History instance missing required columns (sku/pincode/stock); skipped.")
+            continue
+
+        sku = _get_series(df, colmap["sku"]).astype(str).str.strip()
+        pin = _standardize_pincode(_get_series(df, colmap["pincode"]))
+        oos = _is_oos(_get_series(df, colmap["stock"]))
+        period = _period_from_df(df, colmap)
+
+        base = pd.DataFrame({"sku": sku, "pincode": pin, "is_oos": oos})
+        base = base.replace({"": pd.NA}).dropna(subset=["sku", "pincode"])
+        if base.empty:
+            continue
+
+        # overall OOS% for the instance (unique pincodes)
+        total = base["pincode"].nunique()
+        oos_pins = base.loc[base["is_oos"], "pincode"].nunique()
+        overall_pct = (100.0 * oos_pins / total) if total else 0.0
+        overall_series.append({"period": period, "overall_oos_pct": float(overall_pct)})
+
+        # per-SKU OOS% for sparkline (OOS pincodes / total pincodes per SKU)
+        total_p = base.groupby("sku")["pincode"].nunique().rename("total_pincodes")
+        oos_p = base.loc[base["is_oos"]].groupby("sku")["pincode"].nunique().rename("oos_pincodes")
+        t = pd.concat([oos_p, total_p], axis=1).fillna(0)
+        t["oos_pincodes"] = t["oos_pincodes"].astype(int)
+        t["total_pincodes"] = t["total_pincodes"].astype(int)
+        t["oos_pct"] = t.apply(
+            lambda r: (100.0 * r["oos_pincodes"] / r["total_pincodes"]) if r["total_pincodes"] > 0 else 0.0,
+            axis=1,
+        )
+        t = t.reset_index()
+        t["period"] = period
+        sku_period_rows.append(t[["period", "sku", "oos_pct"]])
+
+        # for last-N OOS instances: mark sku as OOS in this instance if any pin OOS
+        sku_any_oos = base.groupby("sku")["is_oos"].any().reset_index()
+        sku_any_oos["period"] = period
+        per_instance_rows.append(sku_any_oos)
+
+    if not overall_series:
+        out["warnings"].append("No usable historical rows after cleaning; history bundle empty.")
+        return out
+
+    timeline = (
+        pd.DataFrame(overall_series)
+        .drop_duplicates(subset=["period"])
+        .sort_values("period")
+        .reset_index(drop=True)
+    )
+    out["oos_timeline"] = timeline
+    out["periods"] = timeline["period"].astype(str).tolist()
+
+    # Build sku_oos_last_n
+    if per_instance_rows:
+        inst = pd.concat(per_instance_rows, ignore_index=True)
+        kept_periods = set(out["periods"])
+        inst = inst[inst["period"].astype(str).isin(kept_periods)]
+
+        agg = (
+            inst.groupby("sku")["is_oos"]
+            .agg(oos_instances=lambda s: int(s.sum()), n_instances="count")
+            .reset_index()
+        )
+        agg["oos_instance_pct"] = agg.apply(
+            lambda r: (100.0 * r["oos_instances"] / r["n_instances"]) if r["n_instances"] else 0.0,
+            axis=1,
+        )
+        agg = agg.sort_values(["oos_instances", "oos_instance_pct", "sku"], ascending=[False, False, True])
+        out["sku_oos_last_n"] = agg.reset_index(drop=True)
+
+    # Build sku_sparklines aligned to timeline periods
+    if sku_period_rows:
+        sp = pd.concat(sku_period_rows, ignore_index=True)
+        piv = sp.pivot_table(index="sku", columns="period", values="oos_pct", aggfunc="first").fillna(0.0)
+
+        cols = out["periods"]
+        for c in cols:
+            if c not in piv.columns:
+                piv[c] = 0.0
+        piv = piv[cols]
+
+        out["sku_sparklines"] = {
+            str(s): [float(x) for x in row.values.tolist()]
+            for s, row in piv.iterrows()
+        }
 
     return out

@@ -13,7 +13,7 @@ from common.agent import run_insight_agent, serialize
 from common.render import render_bullets, render_html_from_text
 from backend.utils.emailer import send_email
 
-app = FastAPI(title="Insight Summary Agent API", version="1.0.0")
+app = FastAPI(title="Insight Summary Agent API", version="1.1.0")
 
 
 class GenerateResponse(BaseModel):
@@ -79,7 +79,10 @@ def _parse_list(val: Optional[str]) -> List[Any]:
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(
     current_file: UploadFile = File(...),
-    previous_file: Optional[UploadFile] = File(None),
+
+    # ✅ multi previous files under the same field name
+    previous_files: List[UploadFile] = File(default=[]),
+
     pincode_map_file: Optional[UploadFile] = File(None),
 
     top_n: int = Form(5),
@@ -93,7 +96,7 @@ async def generate(
     own_brands_json: str = Form("[]"),
 ):
     # -----------------------------
-    # Read files
+    # Read current
     # -----------------------------
     try:
         cur_bytes = await current_file.read()
@@ -101,25 +104,31 @@ async def generate(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read current CSV: {e}")
 
-    prev_df = None
-    if previous_file is not None:
+    # -----------------------------
+    # Read previous list
+    # -----------------------------
+    prev_dfs: List[pd.DataFrame] = []
+    for pf in (previous_files or []):
         try:
-            prev_bytes = await previous_file.read()
-            prev_df = pd.read_csv(io.BytesIO(prev_bytes), low_memory=False)
+            b = await pf.read()
+            df = pd.read_csv(io.BytesIO(b), low_memory=False)
+            prev_dfs.append(df)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to read previous CSV: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to read previous CSV '{getattr(pf, 'filename', 'file')}': {e}")
 
+    # -----------------------------
+    # Read pincode map
+    # -----------------------------
     pincode_map_df = None
     if pincode_map_file is not None:
         try:
             pm_bytes = await pincode_map_file.read()
-            # Keep mapping as strings to preserve leading zeros
             pincode_map_df = pd.read_csv(io.BytesIO(pm_bytes), dtype=str, low_memory=False)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to read pincode mapping CSV: {e}")
 
     # -----------------------------
-    # Parse config lists + booleans
+    # Parse config
     # -----------------------------
     competitor_brands = _parse_list(competitor_brands_json)
     priority_categories = _parse_list(priority_categories_json)
@@ -143,7 +152,7 @@ async def generate(
     try:
         payload = run_insight_agent(
             current_df=cur_df,
-            previous_df=prev_df,
+            previous_dfs=prev_dfs,   # ✅ list
             config=cfg,
             pincode_map_df=pincode_map_df,
         )
@@ -151,14 +160,11 @@ async def generate(
         raise HTTPException(status_code=500, detail=f"Agent failed: {e}")
 
     # -----------------------------
-    # Render summaries
+    # Render
     # -----------------------------
     text_summary = render_bullets(payload, top_n=cfg.top_n)
     html_summary = render_html_from_text(text_summary)
 
-    # -----------------------------
-    # Serialize for API response
-    # -----------------------------
     safe_payload = serialize(payload)
 
     return GenerateResponse(
