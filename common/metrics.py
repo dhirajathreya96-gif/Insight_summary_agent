@@ -624,11 +624,43 @@ def compute_competitor_price_promo_changes(
         out["warnings"].append("Competitor price/promo: missing sku/platform columns.")
         return out
 
+    # -----------------------------------------
+    # Helper: pick a stable brand per (platform, sku)
+    # -----------------------------------------
+    def _pick_brand(series: pd.Series) -> str:
+        # choose most frequent non-empty brand; fallback to first non-empty; else ""
+        try:
+            s = series.dropna().astype(str).str.strip()
+            s = s[s != ""]
+            if s.empty:
+                return ""
+            # mode can return multiple; take the first
+            mode_vals = s.mode()
+            if len(mode_vals):
+                return str(mode_vals.iloc[0]).strip()
+            return str(s.iloc[0]).strip()
+        except Exception:
+            return ""
+
+    # -----------------------------------------
     # current aggregates
+    # -----------------------------------------
     cur_tbl = pd.DataFrame({
         "sku": _get_series(cur, ccol["sku"]).astype(str).str.strip(),
         "platform": _get_series(cur, ccol["platform"]).astype(str).str.strip(),
     })
+
+    # ✅ BRAND (optional)
+    if "brand" in ccol:
+        cur_tbl["brand"] = _get_series(cur, ccol["brand"]).astype(str).str.strip()
+    else:
+        # common fallbacks in case normalize_columns didn't map them
+        brand_col = None
+        for cand in ["Brand", "BRAND", "brand_name", "Brand_Name", "manufacturer", "Manufacturer"]:
+            if cand in cur.columns:
+                brand_col = cand
+                break
+        cur_tbl["brand"] = cur[brand_col].astype(str).str.strip() if brand_col else ""
 
     if "price" in ccol:
         cur_tbl["price"] = _coerce_num(_get_series(cur, ccol["price"]))
@@ -642,15 +674,20 @@ def compute_competitor_price_promo_changes(
 
     cur_tbl["promo_flag"] = _promo_flag(cur, ccol)
 
+    # ✅ aggregate brand alongside platform+sku
     cur_agg = (
         cur_tbl.groupby(["platform", "sku"], as_index=False)
         .agg(
+            brand=("brand", _pick_brand),
             price=("price", "median"),
             disc_pct=("disc_pct", "max"),
             promo_flag=("promo_flag", "max"),
         )
     )
 
+    # -----------------------------------------
+    # previous aggregates
+    # -----------------------------------------
     if previous_df is None or len(previous_df) == 0:
         # If no previous, treat "new promo" as promo_flag True and price_change NA
         cur_agg["prev_price"] = np.nan
@@ -671,6 +708,17 @@ def compute_competitor_price_promo_changes(
                 "sku": _get_series(prev, pcol["sku"]).astype(str).str.strip(),
                 "platform": _get_series(prev, pcol["platform"]).astype(str).str.strip(),
             })
+
+            # ✅ BRAND (optional in prev; used only if you want later)
+            if "brand" in pcol:
+                prev_tbl["brand"] = _get_series(prev, pcol["brand"]).astype(str).str.strip()
+            else:
+                brand_col = None
+                for cand in ["Brand", "BRAND", "brand_name", "Brand_Name", "manufacturer", "Manufacturer"]:
+                    if cand in prev.columns:
+                        brand_col = cand
+                        break
+                prev_tbl["brand"] = prev[brand_col].astype(str).str.strip() if brand_col else ""
 
             if "price" in pcol:
                 prev_tbl["price"] = _coerce_num(_get_series(prev, pcol["price"]))
@@ -698,7 +746,9 @@ def compute_competitor_price_promo_changes(
             cur_agg["prev_disc_pct"] = cur_agg["prev_disc_pct"].fillna(0.0).astype(float)
             cur_agg["prev_promo_flag"] = cur_agg["prev_promo_flag"].fillna(False).astype(bool)
 
+    # -----------------------------------------
     # deltas
+    # -----------------------------------------
     cur_agg["price_change_pct"] = np.where(
         (cur_agg["prev_price"].notna()) & (cur_agg["prev_price"] > 0) & (cur_agg["price"].notna()),
         (cur_agg["price"] - cur_agg["prev_price"]) / cur_agg["prev_price"] * 100.0,
@@ -706,7 +756,9 @@ def compute_competitor_price_promo_changes(
     )
     cur_agg["disc_change_pp"] = cur_agg["disc_pct"].fillna(0.0) - cur_agg["prev_disc_pct"].fillna(0.0)
 
+    # -----------------------------------------
     # flags
+    # -----------------------------------------
     cur_agg["is_price_change"] = cur_agg["price_change_pct"].abs() >= float(price_change_threshold_pct)
     cur_agg["is_new_promo"] = (cur_agg["promo_flag"] == True) & (cur_agg["prev_promo_flag"] == False)
     cur_agg["is_promo_increase"] = cur_agg["disc_change_pp"] >= float(promotion_change_threshold_pct)
@@ -737,6 +789,9 @@ def compute_competitor_price_promo_changes(
     out["summary"] = summary
     return out
 
+
+
+
 # -----------------------------
 # HISTORY BUNDLE (LAST N INSTANCES)
 # -----------------------------
@@ -752,31 +807,32 @@ def build_history_bundle(
     history_dfs: Optional[List[pd.DataFrame]] = None,
     *,
     previous_dfs: Optional[List[pd.DataFrame]] = None,          # alias
-    current_df: Optional[pd.DataFrame] = None,                  # ✅ included
-    pincode_map_df: Optional[pd.DataFrame] = None,              # ✅ included (accepted even if unused)
+    current_df: Optional[pd.DataFrame] = None,                  # included
+    pincode_map_df: Optional[pd.DataFrame] = None,              # accepted (unused here)
     require_serviced: bool = True,
     n_last: int = 5,
-    **kwargs: Any,                                              # ✅ future-proof: ignore unexpected kwargs
+    **kwargs: Any,                                              # future-proof: ignore unexpected kwargs
 ) -> Dict[str, Any]:
     """
-    Builds compact history features used by the agent/render layer:
-      - sku_oos_last_n: top SKUs that are OOS in the last n instances (count + pct)
-      - oos_timeline: overall OOS% by period (for chart)
-      - sku_sparklines: per SKU OOS% series (for sparkline rendering)
+    Builds compact history features used by the agent/render layer.
 
-    Accepts flexible inputs:
-      - history_dfs: explicit ordered list of dfs
-      - previous_dfs + current_df: preferred wiring from agent/backend
-      - pincode_map_df: accepted for API compatibility (unused here)
+    Existing outputs (kept):
+      - sku_oos_last_n: top SKUs that are OOS in the last n instances (count + pct)
+      - oos_timeline: overall OOS% by period
+      - sku_sparklines: per SKU OOS% series aligned to periods
+      - periods: ordered list of periods
+
+    ✅ New outputs (added, platform-level):
+      - sku_platform_oos_last_n: top SKUs OOS in last n instances, per platform
+      - sku_platform_sparklines: per platform -> sku -> list[float] aligned to periods
+      - platforms: list of platforms found in history
     """
 
     # ---------- Resolve the input frames list ----------
     if history_dfs is None:
         history_dfs = []
-
         if previous_dfs:
             history_dfs.extend(list(previous_dfs))
-
         if current_df is not None:
             history_dfs.append(current_df)
 
@@ -784,10 +840,17 @@ def build_history_bundle(
         "warnings": [],
         "n_last": int(n_last),
         "available_instances": int(len(history_dfs or [])),
+
+        # existing
         "sku_oos_last_n": pd.DataFrame(columns=["sku", "oos_instances", "n_instances", "oos_instance_pct"]),
         "oos_timeline": pd.DataFrame(columns=["period", "overall_oos_pct"]),
         "sku_sparklines": {},  # sku -> list[float] aligned to oos_timeline periods
         "periods": [],
+
+        # ✅ new (platform-level)
+        "platforms": [],
+        "sku_platform_oos_last_n": pd.DataFrame(columns=["platform", "sku", "oos_instances", "n_instances", "oos_instance_pct"]),
+        "sku_platform_sparklines": {},  # platform -> {sku -> [float... aligned to periods]}
     }
 
     if not history_dfs:
@@ -800,6 +863,11 @@ def build_history_bundle(
     per_instance_rows: List[pd.DataFrame] = []
     overall_series: List[Dict[str, Any]] = []
     sku_period_rows: List[pd.DataFrame] = []
+
+    # ✅ platform-level collectors
+    per_instance_rows_plat: List[pd.DataFrame] = []
+    sku_period_rows_plat: List[pd.DataFrame] = []
+    platforms_seen: set = set()
 
     for raw in frames:
         df, colmap, warn = normalize_columns(raw)
@@ -847,6 +915,35 @@ def build_history_bundle(
         sku_any_oos["period"] = period
         per_instance_rows.append(sku_any_oos)
 
+        # ✅ PLATFORM-LEVEL HISTORY (only if platform exists)
+        if "platform" in colmap:
+            plat = _get_series(df, colmap["platform"]).astype(str).str.strip()
+            plat = plat.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+
+            base_p = pd.DataFrame({"platform": plat, "sku": sku, "pincode": pin, "is_oos": oos})
+            base_p = base_p.replace({"": pd.NA}).dropna(subset=["platform", "sku", "pincode"])
+            if not base_p.empty:
+                platforms_seen |= set([x for x in base_p["platform"].dropna().unique().tolist() if str(x).strip()])
+
+                # per platform x sku OOS% (OOS pincodes / total pincodes) for sparkline
+                tp_tot = base_p.groupby(["platform", "sku"])["pincode"].nunique().rename("total_pincodes")
+                tp_oos = base_p.loc[base_p["is_oos"]].groupby(["platform", "sku"])["pincode"].nunique().rename("oos_pincodes")
+                tp = pd.concat([tp_oos, tp_tot], axis=1).fillna(0)
+                tp["oos_pincodes"] = tp["oos_pincodes"].astype(int)
+                tp["total_pincodes"] = tp["total_pincodes"].astype(int)
+                tp["oos_pct"] = tp.apply(
+                    lambda r: (100.0 * r["oos_pincodes"] / r["total_pincodes"]) if r["total_pincodes"] > 0 else 0.0,
+                    axis=1,
+                )
+                tp = tp.reset_index()
+                tp["period"] = period
+                sku_period_rows_plat.append(tp[["period", "platform", "sku", "oos_pct"]])
+
+                # mark (platform, sku) as OOS in instance if any pin OOS
+                ps_any = base_p.groupby(["platform", "sku"])["is_oos"].any().reset_index()
+                ps_any["period"] = period
+                per_instance_rows_plat.append(ps_any)
+
     if not overall_series:
         out["warnings"].append("No usable historical rows after cleaning; history bundle empty.")
         return out
@@ -859,6 +956,7 @@ def build_history_bundle(
     )
     out["oos_timeline"] = timeline
     out["periods"] = timeline["period"].astype(str).tolist()
+    out["platforms"] = sorted([str(p) for p in platforms_seen if str(p).strip()])
 
     # Build sku_oos_last_n
     if per_instance_rows:
@@ -893,5 +991,54 @@ def build_history_bundle(
             str(s): [float(x) for x in row.values.tolist()]
             for s, row in piv.iterrows()
         }
+
+    # ✅ Build sku_platform_oos_last_n (platform-level last-N)
+    if per_instance_rows_plat:
+        instp = pd.concat(per_instance_rows_plat, ignore_index=True)
+        kept_periods = set(out["periods"])
+        instp = instp[instp["period"].astype(str).isin(kept_periods)]
+
+        agg_p = (
+            instp.groupby(["platform", "sku"])["is_oos"]
+            .agg(oos_instances=lambda s: int(s.sum()), n_instances="count")
+            .reset_index()
+        )
+        agg_p["oos_instance_pct"] = agg_p.apply(
+            lambda r: (100.0 * r["oos_instances"] / r["n_instances"]) if r["n_instances"] else 0.0,
+            axis=1,
+        )
+        agg_p = agg_p.sort_values(
+            ["platform", "oos_instances", "oos_instance_pct", "sku"],
+            ascending=[True, False, False, True],
+            kind="mergesort",
+        )
+        out["sku_platform_oos_last_n"] = agg_p.reset_index(drop=True)
+
+    # ✅ Build sku_platform_sparklines (platform -> sku -> aligned series)
+    if sku_period_rows_plat:
+        spp = pd.concat(sku_period_rows_plat, ignore_index=True)
+        cols = out["periods"]
+
+        out_map: Dict[str, Dict[str, List[float]]] = {}
+        for plat in sorted([str(p) for p in spp["platform"].dropna().unique().tolist() if str(p).strip()]):
+            dp = spp[spp["platform"].astype(str) == plat].copy()
+            if dp.empty:
+                continue
+
+            piv = (
+                dp.pivot_table(index="sku", columns="period", values="oos_pct", aggfunc="first")
+                .fillna(0.0)
+            )
+            for c in cols:
+                if c not in piv.columns:
+                    piv[c] = 0.0
+            piv = piv[cols]
+
+            out_map[plat] = {
+                str(sku_key): [float(x) for x in row.values.tolist()]
+                for sku_key, row in piv.iterrows()
+            }
+
+        out["sku_platform_sparklines"] = out_map
 
     return out

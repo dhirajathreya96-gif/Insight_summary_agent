@@ -77,13 +77,9 @@ def _sparkline(values: List[Optional[float]]) -> str:
     return "".join(out)
 
 
-# -----------------------------
-# Canonical keying for history lookups
-# -----------------------------
 def _norm_sku_key(x: str) -> str:
     s = str(x or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
-    # light normalization for common weight tokens
     s = s.replace(" g", "g").replace(" gm", "gm")
     return s
 
@@ -189,20 +185,23 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
         lines.append("")
 
     lines.append("EXECUTIVE SUMMARY")
+    lines.append("- Metric definition: Overall stock-out delta is the change in overall OOS% (unique OOS pincodes ÷ total pincodes) vs previous period.")
     overall_delta = comp.get("overall_stockout_delta_pp") if isinstance(comp, dict) else None
     if overall_delta is not None:
         lines.append(f"- Overall stock-out situation changed by {_fmt_delta_pp(float(overall_delta))} vs previous period.")
 
     crit_df = _to_df(comp.get("critical_skus"))
-    lines.append(f"- Critical SKUs: {int(len(crit_df)) if not crit_df.empty else 0}")
+    lines.append("- Metric definition: High-priority SKUs are those with OOS% ≥ 90% OR OOS% increased by ≥ 5 pp vs previous period.")
+    lines.append(f"- High-priority SKUs: {int(len(crit_df)) if not crit_df.empty else 0}")
     if not crit_df.empty and "sku" in crit_df.columns:
         names = crit_df["sku"].astype(str).head(top_n).tolist()
         if names:
-            lines.append(f"- Most critical: {', '.join(names)}")
+            lines.append(f"- Highest priority: {', '.join(names)}")
     lines.append("")
 
     platforms = _platforms_in_stock(stock)
     lines.append("TOP OOS PINCODES (Platform-wise)")
+    lines.append("- Metric definition: OOS% by pincode = OOS SKUs ÷ total SKUs within that pincode on the given platform.")
     if not platforms:
         lines.append("- NA (no platform information available)")
     else:
@@ -217,6 +216,7 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
     lines.append("")
 
     lines.append("STOCK-OUT INSIGHTS (Platform-wise)")
+    lines.append("- Metric definition: SKU OOS% = OOS pincodes ÷ total pincodes for that SKU on the given platform.")
     comp_plat = comp.get("stockouts_by_sku_platform")
     sku_plat_series = stock.get("sku_platform_oos_series") or {}
 
@@ -233,7 +233,6 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                     sku = str(r.get("sku", "")).strip()
                     oos_pct = float(r.get("oos_pct") or 0.0)
 
-                    # ✅ Restore absolute counts: oos/total pincodes
                     try:
                         oos_pins = int(float(r.get("oos_pincodes") or 0))
                     except Exception:
@@ -258,80 +257,94 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                     lines.append(f"  • {sku}: {_fmt_pct(oos_pct)} of pincodes affected{abs_txt}{delta_txt}{spark_txt}")
     lines.append("")
 
-    # -------------------------
-    # Historical last-N section (FIXED: supports both old+new schema, and SKU keying)
-    # -------------------------
-    recent5_df = _to_df(stock.get("recent5_top_skus"))
-    instances = stock.get("recent5_instances_used") or []
-
-    # Optional: per-SKU sparklines bundle (new schema)
-    hist_sparklines = payload.get("history", {}).get("sku_sparklines") if isinstance(payload.get("history"), dict) else None
-    hist_periods = payload.get("history", {}).get("periods") if isinstance(payload.get("history"), dict) else None
+    # Historical last-N (platform-level)
+    history = payload.get("history") or {}
 
     lines.append("TOP SKUs OOS IN LAST 5 SCRAPING INSTANCES (Historical)")
-    if instances:
-        lines.append(f"- Instances used: {', '.join([str(x) for x in instances])}")
+    lines.append("- Metric definition: A SKU counts as 'OOS in an instance' if it is OOS in ≥1 pincode for that platform in that scrape instance.")
 
-    if recent5_df.empty:
-        lines.append("- NA (upload previous files with crawled_date to enable this section)")
+    hist_periods = history.get("periods") or []
+    if hist_periods:
+        lines.append(f"- Instances used: {', '.join([str(x) for x in hist_periods])}")
+
+    hist_df = _to_df(history.get("sku_platform_oos_last_n"))
+    hist_sparks = history.get("sku_platform_sparklines") or {}
+
+    if hist_df.empty or ("platform" not in hist_df.columns) or ("sku" not in hist_df.columns):
+        lines.append("- NA (upload previous files with platform + crawled_date to enable platform-level history)")
     else:
-        # normalize column names between implementations:
-        # new build_history_bundle => ["sku","oos_instances","n_instances","oos_instance_pct"]
-        # old agent bundle => ["sku","instances_oos","max_instances","oos_pct_series"]
-        colset = set([c for c in recent5_df.columns])
+        hist_df = hist_df.copy()
+        hist_df["platform"] = hist_df["platform"].astype(str).str.strip()
+        hist_df["sku"] = hist_df["sku"].astype(str).str.strip()
 
-        def _get_int(row, keys, default=0):
-            for k in keys:
-                if k in row and pd.notna(row.get(k)):
+        plats = sorted([p for p in hist_df["platform"].dropna().unique().tolist() if p])
+        if not plats:
+            lines.append("- NA (no platforms found in history)")
+        else:
+            per_platform_k = max(2, int(top_n))
+
+            for plat in plats:
+                lines.append(f"- {plat}:")
+                dp = hist_df[hist_df["platform"] == plat].copy()
+
+                if dp.empty:
+                    lines.append("  • NA")
+                    continue
+
+                for c in ["oos_instances", "n_instances", "oos_instance_pct"]:
+                    if c in dp.columns:
+                        dp[c] = pd.to_numeric(dp[c], errors="coerce")
+
+                dp = dp.sort_values(
+                    ["oos_instances", "oos_instance_pct", "sku"],
+                    ascending=[False, False, True],
+                    kind="mergesort",
+                ).head(per_platform_k)
+
+                for _, rr in dp.iterrows():
+                    sku = str(rr.get("sku", "")).strip()
                     try:
-                        return int(float(row.get(k)))
+                        oi = int(float(rr.get("oos_instances") or 0))
                     except Exception:
-                        pass
-            return default
+                        oi = 0
+                    try:
+                        ni = int(float(rr.get("n_instances") or 0))
+                    except Exception:
+                        ni = 0
 
-        def _get_series_vals(row):
-            # prefer explicit series field if present
-            if "oos_pct_series" in row and isinstance(row.get("oos_pct_series"), list):
-                return row.get("oos_pct_series") or []
-            # else try history bundle (by normalized sku key)
-            if isinstance(hist_sparklines, dict):
-                sku_raw = str(row.get("sku", "")).strip()
-                key = _norm_sku_key(sku_raw)
-                vals = hist_sparklines.get(key) or hist_sparklines.get(sku_raw)
-                if isinstance(vals, list):
-                    return vals
-            return []
+                    series_vals = []
+                    try:
+                        series_vals = (hist_sparks.get(plat, {}) or {}).get(sku, []) or []
+                    except Exception:
+                        series_vals = []
+                    spark = _sparkline(series_vals) if series_vals else ""
+                    spark_txt = f"  {spark}" if spark else ""
 
-        for _, rr in recent5_df.iterrows():
-            sku = str(rr.get("sku", "")).strip()
-
-            # counts
-            inst_oos = _get_int(rr, ["oos_instances", "instances_oos"], default=0)
-            max_inst = _get_int(rr, ["n_instances", "max_instances"], default=5)
-
-            series_vals = _get_series_vals(rr)
-            spark = _sparkline(series_vals)
-            spark_txt = f"  {spark}" if spark else ""
-
-            lines.append(f"  • {sku}: OOS in {inst_oos}/{max_inst} instances{spark_txt}")
+                    lines.append(f"  • {sku}: OOS in {oi}/{ni} instances{spark_txt}")
     lines.append("")
 
-    # -------------------------
-    # COMPETITIVE INTELLIGENCE (✅ extended)
-    # -------------------------
+    # Competitive intelligence (unchanged)
     ci = cur.get("competitive") or {}
     if isinstance(ci, dict) and ci:
         lines.append("COMPETITIVE INTELLIGENCE")
+        lines.append("- Metric definition: Competitor block uses all brands NOT in your own brand list (brand split).")
+
         if ci.get("definition"):
             lines.append(f"- Definition: {ci['definition']}")
 
         detail = ci.get("top_competitor_stockouts_detail")
         if isinstance(detail, list) and detail:
             lines.append("- Competitor stock-outs (Top):")
+            lines.append("  Metric definition: Competitor SKU OOS% = OOS pincodes ÷ total pincodes (aggregated across serviced pincodes).")
             for item in detail[:top_n]:
                 if not isinstance(item, dict):
                     continue
                 sku = str(item.get("sku", "")).strip()
+                brand = str(item.get("brand", "")).strip()
+                brand_txt = f" [{brand}]" if brand else ""
+
+
+
                 if not sku:
                     continue
                 try:
@@ -342,7 +355,8 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                     pct_txt = _fmt_pct(float(item.get("oos_pct")))
                 except Exception:
                     pct_txt = "NA"
-                lines.append(f"  • {sku}: {oos_txt} OOS pincodes ({pct_txt})")
+                lines.append(f"  • {sku}{brand_txt}: {oos_txt} OOS pincodes ({pct_txt})")
+
                 for pdet in (item.get("platforms") or [])[:6]:
                     plat = str(pdet.get("platform", "")).strip()
                     if not plat:
@@ -355,23 +369,21 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                     except Exception:
                         lines.append(f"     - {plat}: (platform split unavailable)")
 
-        # ✅ competitor price/promo changes (platform-wise max movers, not rollups)
         cchg = (ci.get("competitor_price_promo_changes") or {})
         chg_df = _to_df(cchg.get("changed_rows"))
 
         lines.append("- Competitor price / promotion changes (platform-wise movers):")
+        lines.append("  Metric definition: Price change% = (current median price - previous median price) ÷ previous median price × 100; Discount Δ pp = current max discount% - previous max discount%.")
+
         if chg_df is None or chg_df.empty:
             lines.append("  • NA (no significant price/promo changes detected)")
         else:
             d = chg_df.copy()
 
-            # ---- normalize / coerce ----
-            # numeric fields
             for col in ["price_change_pct", "disc_pct", "disc_change_pp", "price", "prev_price", "prev_disc_pct"]:
                 if col in d.columns:
                     d[col] = pd.to_numeric(d[col], errors="coerce")
 
-            # flag fields (may not exist in all schemas)
             for col in ["is_price_change", "is_new_promo", "is_promo_increase", "promo_flag"]:
                 if col in d.columns:
                     try:
@@ -379,22 +391,19 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                     except Exception:
                         pass
 
-            # required columns guard
             if "platform" not in d.columns or "sku" not in d.columns:
                 lines.append("  • NA (missing platform/sku columns in competitor change output)")
             else:
                 d["platform"] = d["platform"].astype(str).str.strip()
                 d["sku"] = d["sku"].astype(str).str.strip()
 
-                # helpers
                 def _topk(df: pd.DataFrame, k: int, sort_cols: List[str], asc: List[bool]) -> pd.DataFrame:
                     if df is None or df.empty:
                         return df
-                    out = df.sort_values(sort_cols, ascending=asc, kind="mergesort")
-                    return out.head(k)
+                    out2 = df.sort_values(sort_cols, ascending=asc, kind="mergesort")
+                    return out2.head(k)
 
                 def _fmt_price_move(r: pd.Series) -> str:
-                    # e.g. "+9.3% (₹120 → ₹131)" if prices exist
                     pct = r.get("price_change_pct")
                     cur_p = r.get("price")
                     prev_p = r.get("prev_price")
@@ -407,7 +416,6 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                     return pct_txt
 
                 def _fmt_disc(r: pd.Series) -> str:
-                    # e.g. "42.0% (Δ +12.0 pp)"
                     disc = r.get("disc_pct")
                     dpp = r.get("disc_change_pp")
                     disc_txt = _fmt_pct(float(disc)) if pd.notna(disc) else "NA"
@@ -415,12 +423,11 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                         disc_txt += f" (Δ {_fmt_delta_pp(float(dpp))})"
                     return disc_txt
 
-                # per platform sections
                 plats = sorted([p for p in d["platform"].dropna().unique() if str(p).strip()])
                 if not plats:
                     lines.append("  • NA (no platforms found)")
                 else:
-                    per_platform_k = max(2, int(top_n))  # uses render_bullets(top_n=...) as the list size
+                    per_platform_k = max(2, int(top_n))
 
                     for plat in plats:
                         lines.append(f"  • {plat}:")
@@ -430,7 +437,6 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                             lines.append("    - NA")
                             continue
 
-                        # ----- PRICE MOVERS -----
                         if "price_change_pct" in dp.columns:
                             inc = dp[dp["price_change_pct"].notna() & (dp["price_change_pct"] > 0)].copy()
                             dec = dp[dp["price_change_pct"].notna() & (dp["price_change_pct"] < 0)].copy()
@@ -442,7 +448,9 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                                 lines.append("    - Max price increases:")
                                 for _, r in inc.iterrows():
                                     sku = str(r.get("sku", "")).strip()
-                                    lines.append(f"      • {sku}: {_fmt_price_move(r)}")
+                                    brand = str(r.get("brand", "")).strip()
+                                    brand_txt = f" [{brand}]" if brand else ""
+                                    lines.append(f"      • {sku}{brand_txt}: {_fmt_price_move(r)}")
                             else:
                                 lines.append("    - Max price increases: NA")
 
@@ -450,14 +458,14 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                                 lines.append("    - Max price decreases:")
                                 for _, r in dec.iterrows():
                                     sku = str(r.get("sku", "")).strip()
-                                    lines.append(f"      • {sku}: {_fmt_price_move(r)}")
+                                    brand = str(r.get("brand", "")).strip()
+                                    brand_txt = f" [{brand}]" if brand else ""
+                                    lines.append(f"      • {sku}{brand_txt}: {_fmt_price_move(r)}")
                             else:
                                 lines.append("    - Max price decreases: NA")
                         else:
                             lines.append("    - Price movers: NA (price_change_pct missing)")
 
-                        # ----- PROMOS / DISCOUNTS -----
-                        # 1) Maximum current discount%
                         if "disc_pct" in dp.columns:
                             disc_rank = dp[dp["disc_pct"].notna() & (dp["disc_pct"] > 0)].copy()
                             disc_rank = _topk(disc_rank, per_platform_k, ["disc_pct", "disc_change_pp", "sku"], [False, False, True])
@@ -466,13 +474,14 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                                 lines.append("    - Max discounts (current):")
                                 for _, r in disc_rank.iterrows():
                                     sku = str(r.get("sku", "")).strip()
-                                    lines.append(f"      • {sku}: {_fmt_disc(r)}")
+                                    brand = str(r.get("brand", "")).strip()
+                                    brand_txt = f" [{brand}]" if brand else ""
+                                    lines.append(f"      • {sku}{brand_txt}: {_fmt_disc(r)}")
                             else:
                                 lines.append("    - Max discounts (current): NA")
                         else:
                             lines.append("    - Max discounts (current): NA (disc_pct missing)")
 
-                        # 2) Biggest discount increases (Δ pp)
                         if "disc_change_pp" in dp.columns:
                             disc_up = dp[dp["disc_change_pp"].notna() & (dp["disc_change_pp"] > 0)].copy()
                             disc_up = _topk(disc_up, per_platform_k, ["disc_change_pp", "disc_pct", "sku"], [False, False, True])
@@ -481,25 +490,24 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                                 lines.append("    - Biggest discount increases (Δ pp):")
                                 for _, r in disc_up.iterrows():
                                     sku = str(r.get("sku", "")).strip()
+                                    brand = str(r.get("brand", "")).strip()
+                                    brand_txt = f" [{brand}]" if brand else ""
                                     dpp = r.get("disc_change_pp")
-                                    disc = r.get("disc_pct")
+                                    discv = r.get("disc_pct")
                                     dpp_txt = _fmt_delta_pp(float(dpp)) if pd.notna(dpp) else "NA"
-                                    disc_txt = _fmt_pct(float(disc)) if pd.notna(disc) else "NA"
-                                    lines.append(f"      • {sku}: Δ {dpp_txt} (now {disc_txt})")
+                                    disc_txt = _fmt_pct(float(discv)) if pd.notna(discv) else "NA"
+                                    lines.append(f"      • {sku}{brand_txt}: Δ {dpp_txt} (now {disc_txt})")
                             else:
                                 lines.append("    - Biggest discount increases (Δ pp): NA")
                         else:
                             lines.append("    - Biggest discount increases (Δ pp): NA (disc_change_pp missing)")
 
-                        # 3) New promos
                         if "is_new_promo" in dp.columns:
                             newp = dp[dp["is_new_promo"] == True].copy()
-                            # rank new promos by discount pct if available, else keep stable order
                             if "disc_pct" in newp.columns:
                                 newp = newp.sort_values(["disc_pct", "sku"], ascending=[False, True], kind="mergesort")
                             else:
                                 newp = newp.sort_values(["sku"], ascending=[True], kind="mergesort")
-
                             newp = newp.head(per_platform_k)
 
                             if newp is not None and not newp.empty:
@@ -515,10 +523,6 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
                         else:
                             lines.append("    - New promos: NA (is_new_promo missing)")
 
-
-
-
-
         if ci.get("warning"):
             lines.append(f"- Note: {ci['warning']}")
         if ci.get("error"):
@@ -531,6 +535,7 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
     warnings = [w for w in warnings if w]
     if warnings:
         lines.append("DATA QUALITY NOTES")
+        lines.append("- Metric definition: These are issues detected during column normalization / missing required fields / mapping coverage.")
         for w in warnings[:8]:
             lines.append(f"- {w}")
         lines.append("")
@@ -539,7 +544,22 @@ def render_bullets(payload: Dict[str, Any], top_n: int = 5) -> str:
     return "\n".join(lines)
 
 
-def render_html_from_text(text: str) -> str:
+# -----------------------------
+# ✅ FIXED: accept Any (not only str) so dict won't crash
+# -----------------------------
+def render_html_from_text(text: Any) -> str:
+    """
+    Convert plain text into safe HTML for email/preview.
+    Defensive: if caller passes dict/list accidentally, it won't crash.
+    """
+    if text is None:
+        text = ""
+    if not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:
+            text = ""
+
     escaped = (
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -547,3 +567,34 @@ def render_html_from_text(text: str) -> str:
     )
     escaped = escaped.replace("\n", "<br>")
     return f"<div style='font-family: Arial, sans-serif; font-size: 14px; line-height: 1.4'>{escaped}</div>"
+
+
+# -----------------------------
+# ✅ ADDED: missing function used by backend/main.py import
+# -----------------------------
+def render_action_email_html(action_payload_or_text: Any) -> str:
+    """
+    Backend imports this: from common.render import render_action_email_html
+
+    Accepts:
+      - action_payload dict (expected key: 'action_text' OR 'text'), OR
+      - raw action text string
+
+    Returns:
+      - HTML string
+    """
+    action_text = ""
+
+    if isinstance(action_payload_or_text, dict):
+        action_text = (
+            action_payload_or_text.get("action_text")
+            or action_payload_or_text.get("text")
+            or action_payload_or_text.get("summary")
+            or ""
+        )
+    elif isinstance(action_payload_or_text, str):
+        action_text = action_payload_or_text
+    else:
+        action_text = str(action_payload_or_text) if action_payload_or_text is not None else ""
+
+    return render_html_from_text(action_text)
