@@ -105,11 +105,129 @@ def _norm_sku(x: Any) -> str:
     return _as_str(x).strip()
 
 
+def _norm_pincode(x: Any) -> str:
+    """
+    Normalize pincode into a clean digit string.
+    Keeps leading zeros.
+    """
+    s = _as_str(x).strip()
+    if not s:
+        return ""
+    if s.endswith(".0"):
+        s = s[:-2]
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return digits.strip()
+
+
 def _get_preferred_alert_types(cfg: ActionAgentConfig) -> List[str]:
     v = getattr(cfg, "preferred_alert_types", None)
     if isinstance(v, list) and v:
         return [str(x).strip() for x in v if str(x).strip()]
     return ["stockouts", "price_promo", "competition"]
+
+
+# ============================================================
+# ✅ FIXED: City hotspot computed from Stage-1 table that EXISTS
+# ============================================================
+def _extract_pincode_platform_oos_table(stage1_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Reads Stage-1 payload table:
+      current.stockouts.pincode_platform_oos_sku_table
+
+    Returns list[dict] rows (defensive).
+    """
+    cur = stage1_payload.get("current", {}) or {}
+    stock = cur.get("stockouts", {}) or {}
+
+    tbl = stock.get("pincode_platform_oos_sku_table")
+    if tbl is None:
+        return []
+    if isinstance(tbl, list):
+        return [r for r in tbl if isinstance(r, dict)]
+    # sometimes it could be already a dict with changed_rows style etc.
+    if isinstance(tbl, dict) and "changed_rows" in tbl and isinstance(tbl["changed_rows"], list):
+        return [r for r in tbl["changed_rows"] if isinstance(r, dict)]
+    return []
+
+
+def _compute_city_hotspot_line(
+    platform: str,
+    stage1_payload: Dict[str, Any],
+    pincode_to_city: Dict[str, str],
+    top_k_pincodes: int = 3,
+) -> Optional[str]:
+    """
+    City with highest count of OOS pincodes for that platform
+    based on Stage-1 'pincode_platform_oos_sku_table'.
+
+    Output example:
+      "City hotspot: Bengaluru — 12 OOS pincodes (top: 560103 (80.0%), 560076 (70.0%), 560075 (60.0%))"
+    """
+    if not pincode_to_city:
+        return None
+
+    plat = _norm_platform(platform)
+    if not plat:
+        return None
+
+    rows = _extract_pincode_platform_oos_table(stage1_payload)
+    if not rows:
+        return None
+
+    # Filter to platform + OOS% > 0
+    filtered: List[Dict[str, Any]] = []
+    for r in rows:
+        rplat = _norm_platform(r.get("platform"))
+        if rplat != plat:
+            continue
+
+        pin = _norm_pincode(r.get("pincode"))
+        if not pin:
+            continue
+
+        oos_pct = _to_float(r.get("oos_pct"))
+        # Only consider OOS pincodes (strictly > 0)
+        if oos_pct is None or oos_pct <= 0:
+            continue
+
+        city = _as_str(pincode_to_city.get(pin)).strip()
+        if not city:
+            continue
+
+        filtered.append({"city": city, "pincode": pin, "oos_pct": oos_pct})
+
+    if not filtered:
+        return None
+
+    # City -> unique pincodes
+    city_to_pins: Dict[str, Dict[str, float]] = {}
+    for r in filtered:
+        c = r["city"]
+        pin = r["pincode"]
+        pct = float(r["oos_pct"])
+        # keep max oos_pct if duplicate pincode appears
+        city_to_pins.setdefault(c, {})
+        city_to_pins[c][pin] = max(city_to_pins[c].get(pin, -1.0), pct)
+
+    if not city_to_pins:
+        return None
+
+    # Pick city with max unique pincodes; tie-break by highest max oos_pct
+    def _city_score(c: str):
+        pins = city_to_pins.get(c, {})
+        n = len(pins)
+        mx = max(pins.values()) if pins else -1.0
+        return (n, mx)
+
+    best_city = max(city_to_pins.keys(), key=_city_score)
+    pins_map = city_to_pins[best_city]
+    count_unique = len(pins_map)
+
+    # top pincodes by oos_pct desc, then pincode asc
+    top_pins_sorted = sorted(pins_map.items(), key=lambda kv: (-kv[1], kv[0]))[: max(1, int(top_k_pincodes))]
+    top_parts = [f"{pin} ({pct:.1f}%)" for pin, pct in top_pins_sorted]
+
+    return f"City hotspot: {best_city} — {count_unique} OOS pincodes (top: {', '.join(top_parts)})"
 
 
 # ============================================================
@@ -495,9 +613,7 @@ def _fallback_insight_for_platform(platform: str, evidence: List[Dict[str, Any]]
             bullets.append(f"{sku}{brand_txt}: " + ", ".join(parts))
             added_pp += 1
 
-    # ✅ Never add "evidence available" placeholders
-    bullets = [b for b in bullets if b][:50]  # allow many stockout lines; still safe cap
-
+    bullets = [b for b in bullets if b][:200]
     if not bullets:
         bullets = ["No qualifying evidence after filters (check Stage 1 payload / thresholds)."]
 
@@ -506,7 +622,7 @@ def _fallback_insight_for_platform(platform: str, evidence: List[Dict[str, Any]]
 
     return ActionInsight(
         platform=platform,
-        title=insight_line,  # ✅ this becomes "Insight:"
+        title=insight_line,
         severity="high",
         trend="worsening",
         urgency="today",
@@ -584,7 +700,6 @@ def _call_openai_batch(
                     continue
                 if not (i.evidence or []):
                     continue
-                # require title (insight)
                 if not (i.title or "").strip():
                     continue
                 seen.add(p.lower())
@@ -607,7 +722,7 @@ def _call_openai_batch(
 
 
 # ============================================================
-# Rendering (Insight -> Action -> Evidence)
+# Rendering (Insight -> Data points)
 # ============================================================
 def _render_action_text(insights: List[Dict[str, Any]]) -> str:
     """
@@ -616,7 +731,6 @@ def _render_action_text(insights: List[Dict[str, Any]]) -> str:
     Insight
     Data points
     """
-
     if not insights:
         return "No platform breached alert thresholds."
 
@@ -637,7 +751,6 @@ def _render_action_text(insights: List[Dict[str, Any]]) -> str:
 
         for e in evidence:
             if isinstance(e, str):
-                # safety cleanup
                 cleaned = (
                     e.replace("Δ OOS NA vs prev", "")
                      .replace(", Δ OOS NA vs prev", "")
@@ -654,11 +767,25 @@ def _render_action_text(insights: List[Dict[str, Any]]) -> str:
 
 
 # ============================================================
-# Public entrypoint
+# ✅ Public entrypoint (ONLY CHANGE: hotspot line works)
 # ============================================================
-def generate_action_report(stage1_payload: Dict[str, Any], cfg: ActionAgentConfig) -> Dict[str, Any]:
+def generate_action_report(
+    stage1_payload: Dict[str, Any],
+    cfg: ActionAgentConfig,
+    pincode_city_map: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     generated_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     scope = f"Stage 2 — Platform-Specific Actions (top_n={cfg.top_n})"
+
+    # Build pincode->city mapping (ONLY from uploaded pincode_map_file)
+    pincode_to_city: Dict[str, str] = {}
+    for r in (pincode_city_map or []):
+        if not isinstance(r, dict):
+            continue
+        pin = _norm_pincode(r.get("pincode"))
+        city = _as_str(r.get("city")).strip()
+        if pin and city:
+            pincode_to_city[pin] = city
 
     platform_evidence = _build_platform_evidence(stage1_payload, cfg)
 
@@ -684,9 +811,22 @@ def generate_action_report(stage1_payload: Dict[str, Any], cfg: ActionAgentConfi
             llm_error = f"{type(e).__name__}: {e}"
             insights = []
 
-    # ✅ fallback if LLM disabled or empty
     if breached and not insights:
         insights = [_fallback_insight_for_platform(p, platform_evidence.get(p, []), cfg) for p in breached]
+
+    # ✅ Inject city hotspot line into evidence list (at top)
+    if pincode_to_city:
+        for i in insights:
+            plat = _norm_platform(i.platform)
+            hotspot_line = _compute_city_hotspot_line(
+                platform=plat,
+                stage1_payload=stage1_payload,
+                pincode_to_city=pincode_to_city,
+                top_k_pincodes=3,
+            )
+            if hotspot_line:
+                existing = i.evidence or []
+                i.evidence = [hotspot_line] + existing
 
     action_text = _render_action_text(
         insights=[i.model_dump() for i in insights],
@@ -704,5 +844,6 @@ def generate_action_report(stage1_payload: Dict[str, Any], cfg: ActionAgentConfi
             "llm_error": llm_error,
             "use_llm": bool(getattr(cfg, "use_llm", True)),
             "model": getattr(cfg, "llm_model", None),
+            "pincode_city_map_rows": len(pincode_city_map or []),
         },
     }

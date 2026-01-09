@@ -1,4 +1,3 @@
-# backend/main.py
 from __future__ import annotations
 
 from dotenv import load_dotenv
@@ -137,7 +136,10 @@ async def generate(
             df = pd.read_csv(io.BytesIO(b), low_memory=False)
             prev_dfs.append(df)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to read previous CSV '{getattr(pf, 'filename', 'file')}': {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to read previous CSV '{getattr(pf, 'filename', 'file')}': {e}",
+            )
 
     # Read pincode map
     pincode_map_df = None
@@ -191,6 +193,7 @@ async def generate(
 
 # ============================================================
 # STAGE 2: Actionable insights (platform-specific; sanitize outputs)
+# ✅ ONLY CHANGE: build a robust pincode_city_map list for action agent
 # ============================================================
 @app.post("/generate-actions", response_model=GenerateActionResponse)
 async def generate_actions(
@@ -237,14 +240,61 @@ async def generate_actions(
             df = pd.read_csv(io.BytesIO(b), low_memory=False)
             prev_dfs.append(df)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to read previous CSV '{getattr(pf, 'filename', 'file')}': {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to read previous CSV '{getattr(pf, 'filename', 'file')}': {e}",
+            )
 
-    # Read pincode map
+    # Read pincode map (Stage1 passthrough dataframe + Stage2 pincode_city_map list)
     pincode_map_df = None
+    pincode_city_map: Optional[List[Dict[str, Any]]] = None
+
     if pincode_map_file is not None:
         try:
             pm_bytes = await pincode_map_file.read()
             pincode_map_df = pd.read_csv(io.BytesIO(pm_bytes), dtype=str, low_memory=False)
+
+            # ✅ Create list[dict] for Stage2 action agent (expects pincode, city)
+            # Robust to column naming variants: pincode/pin/pin_code/postal_code/zip and city/region/district/etc.
+            tmp = pincode_map_df.copy()
+            cols = {str(c).strip().lower(): c for c in tmp.columns}
+
+            pin_col = None
+            city_col = None
+
+            for k in ["pincode", "pin", "pin_code", "postal_code", "postcode", "zip"]:
+                if k in cols:
+                    pin_col = cols[k]
+                    break
+
+            for k in ["city", "region", "town", "district", "area"]:
+                if k in cols:
+                    city_col = cols[k]
+                    break
+
+            if pin_col and city_col:
+                out = tmp[[pin_col, city_col]].copy()
+                out.columns = ["pincode", "city"]
+
+                out["pincode"] = (
+                    out["pincode"]
+                    .astype(str)
+                    .str.replace(r"\.0$", "", regex=True)
+                    .str.strip()
+                )
+                # keep leading zeros; ensure 6-digit for numeric pins when <=6
+                out["pincode"] = out["pincode"].apply(
+                    lambda x: x.zfill(6) if x.isdigit() and len(x) <= 6 else x
+                )
+
+                out["city"] = out["city"].astype(str).str.strip()
+
+                out = out[(out["pincode"].str.len() > 0) & (out["city"].str.len() > 0)]
+                pincode_city_map = out[["pincode", "city"]].to_dict(orient="records")
+            else:
+                # keep Stage1 df usage as-is; Stage2 hotspot will just not run
+                pincode_city_map = None
+
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to read pincode mapping CSV: {e}")
 
@@ -296,9 +346,13 @@ async def generate_actions(
         llm_model=str(llm_model).strip() if str(llm_model).strip() else "gpt-4o-mini",
     )
 
-    # Generate Action Report
+    # Generate Action Report (✅ pass pincode_city_map)
     try:
-        action_payload = generate_action_report(stage1_safe, action_cfg)
+        action_payload = generate_action_report(
+            stage1_safe,
+            action_cfg,
+            pincode_city_map=pincode_city_map,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Action agent failed: {e}")
 
@@ -348,7 +402,10 @@ async def export_platform_pincode_insights_endpoint(
             df = pd.read_csv(io.BytesIO(b), low_memory=False)
             prev_dfs.append(df)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to read previous CSV '{getattr(pf, 'filename', 'file')}': {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to read previous CSV '{getattr(pf, 'filename', 'file')}': {e}",
+            )
 
     # Read pincode map
     pincode_map_df = None
